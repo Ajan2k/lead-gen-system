@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 require('dotenv').config();
+const { generatePainPoints } = require('./services/painPointService');
 
 // 👇 THE CRITICAL FIX: Import the database connection
 const pool = require('./config/db'); 
@@ -104,6 +105,34 @@ app.post('/api/webhooks/zapier', async (req, res) => {
         res.status(500).json({ error: "Failed to store lead" });
     }
 });
+
+
+const { generatePainPoints } = require('./services/painPointService');
+
+// Generate Pain Points
+app.post('/api/pain-points/generate', async (req, res) => {
+    const { industry, persona } = req.body;
+    const points = await generatePainPoints(industry, persona);
+    res.json(points);
+});
+
+// Save Selected Pain Points
+app.post('/api/pain-points/save', async (req, res) => {
+    try {
+        const { industry, persona, selectedPoints } = req.body;
+        const queries = selectedPoints.map(point => {
+            return pool.query(
+                'INSERT INTO pain_points (industry, persona, pain_point_title, description, relevance_score) VALUES ($1, $2, $3, $4, $5)',
+                [industry, persona, point.title, point.description, point.relevance]
+            );
+        });
+        await Promise.all(queries);
+        res.status(201).json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 // Start the Server
 const PORT = process.env.PORT || 4000;
