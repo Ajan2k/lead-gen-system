@@ -22,7 +22,9 @@ const generatePainPoints = async (industry, persona) => {
         });
 
         const content = completion.choices[0]?.message?.content || '[]';
-        return JSON.parse(content.replace(/```json|```/g, ''));
+        // Clean markdown formatting if present
+        const cleanJson = content.replace(/```json|```/g, '');
+        return JSON.parse(cleanJson);
     } catch (error) {
         console.error('Pain Point AI Error:', error);
         return [];
