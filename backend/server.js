@@ -6,10 +6,12 @@ const cors = require('cors');
 require('dotenv').config();
 
 const pool = require('./config/db');
-const { generatePersonaInsights } = require('./services/painPointService');
+const { analyzeIcpWithDataset } = require('./services/icpAnalysisService');
 
 const app = express();
 const server = http.createServer(app);
+
+const { sendPersonalizedEmails } = require('./services/emailService');
 
 const io = new Server(server, {
   cors: {
@@ -26,14 +28,14 @@ app.use(
 );
 app.use(express.json());
 
-// Health check
+// Simple health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-//
-// 1. ICP LEADS ROUTES
-//
+/* -------------------------------------------------------------------------- */
+/*                              1. ICP (LEADS) API                            */
+/* -------------------------------------------------------------------------- */
 
-// Get all leads (ICPs)
+// Get all ICPs
 app.get('/api/leads', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -46,7 +48,7 @@ app.get('/api/leads', async (req, res) => {
   }
 });
 
-// Create a new lead (ICP)
+// Create new ICP
 app.post('/api/leads', async (req, res) => {
   try {
     const { profile_name, industry, revenue, location } = req.body;
@@ -75,14 +77,30 @@ app.post('/api/leads', async (req, res) => {
   }
 });
 
-//
-// 2. PERSONA ROUTES (for custom personas)
-//
+// Get 100 recommended businesses for a specific ICP
+// Also generates persona insights for that ICP using local templates.
+app.get('/api/leads/:id/matches', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM leads WHERE id = $1', [id]);
+    const icp = result.rows[0];
 
-/**
- * Get all custom personas (names).
- * We only store custom personas here; default personas are handled in FE.
- */
+    if (!icp) {
+      return res.status(404).json({ error: 'ICP not found' });
+    }
+
+    const matches = await analyzeIcpWithDataset(icp);
+    res.json(matches);
+  } catch (err) {
+    console.error('Error building ICP matches:', err);
+    res.status(500).json({ error: 'Failed to build matches' });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                             2. PERSONAS (optional)                         */
+/* -------------------------------------------------------------------------- */
+
 app.get('/api/personas', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -95,7 +113,6 @@ app.get('/api/personas', async (req, res) => {
   }
 });
 
-// Create new persona
 app.post('/api/personas', async (req, res) => {
   try {
     const rawName = req.body.name || '';
@@ -109,7 +126,6 @@ app.post('/api/personas', async (req, res) => {
     res.status(201).json({ name: rows[0].name });
   } catch (err) {
     if (err.code === '23505') {
-      // unique_violation
       return res.status(409).json({ error: 'Persona already exists' });
     }
     console.error('Error creating persona:', err);
@@ -117,7 +133,6 @@ app.post('/api/personas', async (req, res) => {
   }
 });
 
-// Delete persona and its insights
 app.delete('/api/personas/:name', async (req, res) => {
   const rawName = req.params.name || '';
   const name = rawName.trim();
@@ -129,12 +144,10 @@ app.delete('/api/personas/:name', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Delete associated insights
     await client.query('DELETE FROM persona_insights WHERE persona = $1', [
       name,
     ]);
 
-    // Delete persona record
     const { rowCount } = await client.query(
       'DELETE FROM personas WHERE name = $1',
       [name]
@@ -156,88 +169,27 @@ app.delete('/api/personas/:name', async (req, res) => {
   }
 });
 
-//
-// 3. INSIGHTS / PERSONA ROUTES
-//
+/* -------------------------------------------------------------------------- */
+/*                          3. PERSONA INSIGHTS API                           */
+/* -------------------------------------------------------------------------- */
 
-// Generate AI insights for (industry, persona) and save to DB
-app.post('/api/insights/generate', async (req, res) => {
-  try {
-    const rawIndustry = req.body.industry || '';
-    const rawPersona = req.body.persona || '';
-
-    const industry = rawIndustry.trim();
-    const persona = rawPersona.trim();
-
-    if (!industry || !persona) {
-      return res
-        .status(400)
-        .json({ error: 'industry and persona are required' });
-    }
-
-    console.log(`🤖 Generating insights for "${persona}" in industry "${industry}"`);
-
-    const data = await generatePersonaInsights(industry, persona);
-
-    const insights = [
-      ...data.pain_points.map((p) => ({ ...p, type: 'pain_point' })),
-      ...data.outcomes.map((o) => ({ ...o, type: 'outcome' })),
-    ];
-
-    if (insights.length === 0) {
-      return res.status(500).json({ error: 'AI returned no results' });
-    }
-
-    const values = insights.map((item) => [
-      industry,
-      persona,
-      item.title,
-      item.description,
-      item.relevance || 8,
-      item.type,
-      false, // is_custom
-      'unassigned',
-    ]);
-
-    const placeholders = values
-      .map(
-        (_, i) =>
-          `($${i * 8 + 1}, $${i * 8 + 2}, $${i * 8 + 3}, $${i * 8 + 4}, $${i * 8 + 5}, $${i * 8 + 6}, $${i * 8 + 7}, $${i * 8 + 8})`
-      )
-      .join(',');
-
-    const query = `
-      INSERT INTO persona_insights
-      (industry, persona, title, description, relevance_score, type, is_custom, status)
-      VALUES ${placeholders}
-      RETURNING *;
-    `;
-
-    const { rows } = await pool.query(query, values.flat());
-    res.json(rows);
-  } catch (err) {
-    console.error('❌ Generation Error:', err);
-    res.status(500).json({ error: 'Generation failed' });
-  }
-});
-
-// Fetch insights for a persona, optionally by industry
+// Get insights for persona + icpId
 app.get('/api/insights/:persona', async (req, res) => {
   try {
     const { persona } = req.params;
-    const { industry } = req.query;
+    const { icpId } = req.query;
 
-    let query = 'SELECT * FROM persona_insights WHERE persona = $1';
-    const params = [persona];
-
-    if (industry) {
-      query += ' AND LOWER(industry) = LOWER($2)';
-      params.push(industry);
+    if (!icpId) {
+      return res
+        .status(400)
+        .json({ error: 'icpId query parameter is required' });
     }
 
-    query += ' ORDER BY id DESC';
+    const { rows } = await pool.query(
+      'SELECT * FROM persona_insights WHERE persona = $1 AND icp_id = $2 ORDER BY id DESC',
+      [persona, icpId]
+    );
 
-    const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (err) {
     console.error('Error fetching insights:', err);
@@ -245,7 +197,7 @@ app.get('/api/insights/:persona', async (req, res) => {
   }
 });
 
-// Bulk save mapping status (Save Mapping)
+// Bulk save mapping status
 app.put('/api/insights/bulk-status', async (req, res) => {
   const { updates } = req.body;
 
@@ -277,16 +229,16 @@ app.put('/api/insights/bulk-status', async (req, res) => {
   }
 });
 
-// Create a custom insight manually (pain point or outcome)
+// Add custom insight for ICP + persona
 app.post('/api/insights/custom', async (req, res) => {
   try {
-    let { industry, persona, title, description, type } = req.body;
+    let { icpId, industry, persona, title, description, type } = req.body;
     type = type || 'pain_point';
 
-    if (!industry || !persona || !title || !description) {
-      return res
-        .status(400)
-        .json({ error: 'industry, persona, title, description are required' });
+    if (!icpId || !persona || !title || !description) {
+      return res.status(400).json({
+        error: 'icpId, persona, title, and description are required',
+      });
     }
 
     if (!['pain_point', 'outcome'].includes(type)) {
@@ -295,13 +247,14 @@ app.post('/api/insights/custom', async (req, res) => {
 
     const query = `
       INSERT INTO persona_insights
-      (industry, persona, title, description, relevance_score, type, is_custom, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      (icp_id, industry, persona, title, description, relevance_score, type, is_custom, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *;
     `;
 
     const { rows } = await pool.query(query, [
-      industry.trim(),
+      icpId,
+      (industry || 'General').trim(),
       persona.trim(),
       title.trim(),
       description.trim(),
@@ -318,7 +271,7 @@ app.post('/api/insights/custom', async (req, res) => {
   }
 });
 
-// Delete a single insight (pain point or outcome)
+// Delete a single insight
 app.delete('/api/insights/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -335,6 +288,32 @@ app.delete('/api/insights/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to delete insight' });
   }
 });
+
+// Publish an email campaign to a list of leads using Brevo
+app.post('/api/email/publish', async (req, res) => {
+  try {
+    const { subject, bodyTemplate, leads } = req.body;
+
+    if (!subject || !bodyTemplate || !Array.isArray(leads)) {
+      return res
+        .status(400)
+        .json({ error: 'subject, bodyTemplate and leads are required' });
+    }
+
+    const result = await sendPersonalizedEmails({
+      subject,
+      bodyTemplate,
+      leads,
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error sending campaign:', err);
+    res.status(500).json({ error: 'Failed to send emails' });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
