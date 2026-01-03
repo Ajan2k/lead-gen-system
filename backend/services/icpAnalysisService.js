@@ -6,16 +6,16 @@ const { generatePersonaInsights } = require('./painPointService');
 const DEFAULT_PERSONAS = ['CTO', 'Marketing Manager', 'Sales Director'];
 
 /**
- * Analyze an ICP using ONLY your dataset and local persona templates.
- * 1) Select top 100 relevant companies (heuristic).
- * 2) Generate persona-based pain points & outcomes and store in persona_insights with icp_id.
- * Returns the 100 companies (for the Leads UI).
+ * For a given ICP:
+ * 1) Select top 100 relevant companies from dataset (heuristic).
+ * 2) If this ICP has no AI-generated persona insights yet,
+ *    call Groq ONCE per persona and save the results tied to icp_id.
+ * Returns the 100 companies for the Leads UI.
  */
-async function analyzeIcpWithDataset(icp) {
+async function analyzeIcpWithDatasetAndGroq(icp) {
   const icpId = icp.id;
-  const icpIndustry = icp.industry || 'General';
 
-  // 1. Get candidate companies and choose top 100
+  // 1. Recommended companies (for Leads UI)
   const candidates = await getCandidateCompanies(icp, 300);
   const top = candidates.slice(0, 100);
 
@@ -46,27 +46,35 @@ async function analyzeIcpWithDataset(icp) {
     })
     .filter(Boolean);
 
-  // 2. Generate and store persona insights for this ICP
-  await savePersonaInsightsForIcp(icpId, icpIndustry);
+  // 2. Persona insights (only if this ICP has none yet)
+  await ensurePersonaInsightsForIcp(icp);
 
   return selectedCompanies;
 }
 
-async function savePersonaInsightsForIcp(icpId, icpIndustry) {
+async function ensurePersonaInsightsForIcp(icp) {
+  const icpId = icp.id;
+  const icpIndustry = icp.industry || 'General';
+
+  // Check if this ICP already has non-custom insights
+  const existing = await pool.query(
+    'SELECT COUNT(*)::int AS count FROM persona_insights WHERE icp_id = $1 AND is_custom = false',
+    [icpId]
+  );
+  const count = existing.rows[0]?.count || 0;
+  if (count > 0) {
+    // Already generated once – respect saved mapping, no new Groq calls.
+    return;
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Remove old AI-generated insights for this ICP (keep custom)
-    await client.query(
-      'DELETE FROM persona_insights WHERE icp_id = $1 AND is_custom = false',
-      [icpId]
-    );
-
     const rowsToInsert = [];
 
     for (const persona of DEFAULT_PERSONAS) {
-      const data = await generatePersonaInsights(icpIndustry, persona);
+      const data = await generatePersonaInsights(icp, persona);
       const pains = data.pain_points || [];
       const outs = data.outcomes || [];
 
@@ -132,4 +140,4 @@ async function savePersonaInsightsForIcp(icpId, icpIndustry) {
   }
 }
 
-module.exports = { analyzeIcpWithDataset };
+module.exports = { analyzeIcpWithDatasetAndGroq };

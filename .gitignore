@@ -6,3 +6,4 @@ node_modules/
 frontend/node_modules/
 backend/data/business_dataset.csv
 backend/.env
+backend/data/Influencer_Marketing_130_Screens_Full.xlsx

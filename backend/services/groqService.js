@@ -6,6 +6,10 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
+/**
+ * Call Groq chat completions with a short prompt.
+ * Returns the full Groq response.
+ */
 async function createChatCompletion(prompt) {
   const response = await groq.chat.completions.create({
     model: 'llama-3.1-8b-instant',
@@ -17,13 +21,15 @@ async function createChatCompletion(prompt) {
       },
       { role: 'user', content: prompt },
     ],
-    temperature: 0.6,
+    max_tokens: 700, // keep well below your TPM limit
+    temperature: 0.7,
   });
-
   return response;
 }
 
-// Helper to pull a JSON object out of the model text
+/**
+ * Extract a JSON object from Groq text output.
+ */
 function extractJson(text) {
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) {
