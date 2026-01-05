@@ -56,14 +56,12 @@ async function ensurePersonaInsightsForIcp(icp) {
   const icpId = icp.id;
   const icpIndustry = icp.industry || 'General';
 
-  // Check if this ICP already has non-custom insights
   const existing = await pool.query(
     'SELECT COUNT(*)::int AS count FROM persona_insights WHERE icp_id = $1 AND is_custom = false',
     [icpId]
   );
   const count = existing.rows[0]?.count || 0;
   if (count > 0) {
-    // Already generated once – respect saved mapping, no new Groq calls.
     return;
   }
 

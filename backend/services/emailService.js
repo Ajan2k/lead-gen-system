@@ -90,4 +90,61 @@ async function sendPersonalizedEmails({ subject, bodyTemplate, leads }) {
   return { sent, skipped, errors };
 }
 
-module.exports = { sendPersonalizedEmails };
+/**
+ * Fetch aggregated Brevo SMTP stats for the last `days` days.
+ * Returns metrics similar to the Brevo dashboard:
+ * Events, Delivered, Opens, Clicks, Bounced.
+ */
+async function fetchBrevoAggregatedStats({ days = 1 } = {}) {
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) {
+    throw new Error('BREVO_API_KEY must be set in .env');
+  }
+
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+  const startDate = start.toISOString().slice(0, 10); // YYYY-MM-DD
+  const endDate = now.toISOString().slice(0, 10);     // YYYY-MM-DD
+
+  const url = 'https://api.brevo.com/v3/smtp/statistics/aggregatedReport';
+
+  const resp = await axios.get(url, {
+    headers: {
+      'api-key': apiKey,
+      accept: 'application/json',
+    },
+    params: {
+      startDate,
+      endDate,
+    },
+  });
+
+  const data = resp.data || {};
+
+  const events = data.requests ?? 0;
+  const delivered = data.delivered ?? 0;
+  const opens = data.uniqueOpens ?? data.opens ?? 0;
+  const clicks = data.uniqueClicks ?? data.clicks ?? 0;
+  const softBounces = data.softBounces ?? 0;
+  const hardBounces = data.hardBounces ?? 0;
+  const bounced = softBounces + hardBounces;
+
+  return {
+    range: data.range || { from: startDate, to: endDate },
+    events,
+    delivered,
+    opens,
+    clicks,
+    bounced,
+    softBounces,
+    hardBounces,
+    raw: data,
+  };
+}
+
+// IMPORTANT: export BOTH functions
+module.exports = {
+  sendPersonalizedEmails,
+  fetchBrevoAggregatedStats,
+};

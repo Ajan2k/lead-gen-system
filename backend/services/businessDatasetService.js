@@ -3,15 +3,22 @@ const fs = require('fs');
 const path = require('path');
 const csv = require('csv-parser');
 
-let businesses = [];
-let loaded = false;
-let loadingPromise = null;
-
 const DATASET_PATH = path.join(__dirname, '..', 'data', 'business_dataset.csv');
 
+// In‑memory cache
+let businesses = null;
+let loadingPromise = null;
+
+/**
+ * Load the CSV dataset once and cache it in memory.
+ */
 function loadDataset() {
-  if (loaded) return Promise.resolve(businesses);
-  if (loadingPromise) return loadingPromise;
+  if (businesses) {
+    return Promise.resolve(businesses);
+  }
+  if (loadingPromise) {
+    return loadingPromise;
+  }
 
   loadingPromise = new Promise((resolve, reject) => {
     const rows = [];
@@ -20,7 +27,6 @@ function loadDataset() {
       .on('data', (row) => rows.push(row))
       .on('end', () => {
         businesses = rows;
-        loaded = true;
         console.log(`✅ Loaded business dataset with ${rows.length} rows`);
         resolve(businesses);
       })
@@ -37,7 +43,9 @@ function clean(val) {
   return (val || '').toString().trim().toLowerCase();
 }
 
-// Simple heuristic scorer for ICP fit
+/**
+ * Simple heuristic scorer for ICP fit
+ */
 function scoreBusiness(row, icp) {
   let score = 0;
   const ind = clean(icp.industry);
@@ -65,10 +73,8 @@ function scoreBusiness(row, icp) {
   }
 
   if (rev && salesVolume) {
-    if (salesVolume.includes('million') && rev.toLowerCase().includes('m'))
-      score += 2;
-    if (salesVolume.includes('billion') && rev.toLowerCase().includes('b'))
-      score += 2;
+    if (salesVolume.includes('million') && rev.includes('m')) score += 2;
+    if (salesVolume.includes('billion') && rev.includes('b')) score += 2;
   }
 
   if (!score) score = 1;
@@ -92,7 +98,9 @@ async function getCandidateCompanies(icp, candidateCount = 200) {
   return scored.slice(0, candidateCount);
 }
 
+// IMPORTANT: export as an object with this exact name
 module.exports = {
   loadDataset,
   getCandidateCompanies,
+  scoreBusiness,
 };

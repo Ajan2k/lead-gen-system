@@ -7,6 +7,14 @@ const bcrypt = require('bcryptjs');
 require('dotenv').config();
 
 const pool = require('./config/db');
+const {
+  analyzeIcpWithDatasetAndGroq,
+} = require('./services/icpAnalysisService');
+
+const {
+  sendPersonalizedEmails,
+  fetchBrevoAggregatedStats,
+} = require('./services/emailService');
 
 const app = express();
 const server = http.createServer(app);
@@ -232,10 +240,29 @@ app.post('/api/leads', async (req, res) => {
   }
 });
 
-// Recommendations stub (no-op, just an empty list)
+// GET /api/leads/:id/matches
+// Option B: Use icpAnalysisService -> dataset + Groq-driven persona insights
 app.get('/api/leads/:id/matches', async (req, res) => {
   try {
-    res.json([]);
+    const icpId = Number(req.params.id);
+    if (!icpId) {
+      return res.status(400).json({ error: 'Invalid ICP id' });
+    }
+
+    // 1. Load the ICP definition from the "leads" table
+    const { rows } = await pool.query('SELECT * FROM leads WHERE id = $1', [
+      icpId,
+    ]);
+    const icp = rows[0];
+    if (!icp) {
+      return res.status(404).json({ error: 'ICP not found' });
+    }
+
+    // 2. Analyze ICP with dataset + Groq (also ensures persona_insights once)
+    const companies = await analyzeIcpWithDatasetAndGroq(icp);
+
+    // 3. Return companies in the shape the frontend expects
+    res.json(companies);
   } catch (err) {
     console.error('Error building ICP matches:', err);
     res.status(500).json({ error: 'Failed to build matches' });
@@ -405,7 +432,6 @@ app.put('/api/influencers/:id/verify', async (req, res) => {
       return res.status(404).json({ error: 'Influencer not found' });
     }
 
-    // Here you can send verification email via Brevo if you want.
     console.log(
       `Influencer ${rows[0].email} verification status changed to`,
       rows[0].verified
@@ -444,25 +470,47 @@ app.get('/api/influencers/stats', async (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 // Log campaigns (we are not sending externally, just tracking numbers)
+// server.js
+// Log campaigns AND send via Brevo
 app.post('/api/email/publish', async (req, res) => {
   try {
-    const { userId, subject, leads } = req.body || {};
+    const { userId, subject, bodyTemplate, leads } = req.body || {};
 
-    if (!userId || !subject || !Array.isArray(leads)) {
+    if (!userId || !subject || !bodyTemplate || !Array.isArray(leads)) {
       return res.status(400).json({
-        error: 'userId, subject and leads are required',
+        error: 'userId, subject, bodyTemplate and leads are required',
       });
     }
 
-    const sent = leads.filter((l) => l.email).length;
-    const skipped = leads.length - sent;
+    // Separate leads with and without email
+    const leadsWithEmail = leads.filter((l) => l.email);
+    const leadsWithoutEmail = leads.length - leadsWithEmail.length;
 
-    // For now, assume all sent = delivered, 0 bounces, 0 tracked.
+    // Send via Brevo
+    let brevoResult;
+    try {
+      brevoResult = await sendPersonalizedEmails({
+        subject,
+        bodyTemplate,
+        leads: leadsWithEmail,
+      });
+    } catch (err) {
+      console.error('Error sending via Brevo:', err.message);
+      return res
+        .status(500)
+        .json({ error: 'Failed to send emails via Brevo' });
+    }
+
+    const sent = brevoResult.sent || 0;
+    const skippedInsideBrevo = brevoResult.skipped || 0;
+    const totalSkipped = leadsWithoutEmail + skippedInsideBrevo;
+
     const delivered = sent;
     const softBounces = 0;
     const hardBounces = 0;
     const tracked = 0;
 
+    // Log campaign stats in DB as before
     await pool.query(
       `
         INSERT INTO email_campaigns
@@ -473,7 +521,7 @@ app.post('/api/email/publish', async (req, res) => {
         Number(userId),
         subject,
         sent,
-        skipped,
+        totalSkipped,
         delivered,
         softBounces,
         hardBounces,
@@ -483,18 +531,18 @@ app.post('/api/email/publish', async (req, res) => {
 
     res.json({
       sent,
-      skipped,
+      skipped: totalSkipped,
       delivered,
       softBounces,
       hardBounces,
       tracked,
+      errors: brevoResult.errors || [],
     });
   } catch (err) {
     console.error('Error in /api/email/publish:', err);
     res.status(500).json({ error: 'Failed to log campaign' });
   }
 });
-
 // GET /api/email/stats?userId=123  -> stats for user dashboard
 app.get('/api/email/stats', async (req, res) => {
   try {
@@ -538,6 +586,24 @@ app.get('/api/email/stats', async (req, res) => {
   }
 });
 
+
+// GET /api/email/brevo-stats?days=1
+// Returns aggregated SMTP stats from Brevo (account-wide)
+app.get('/api/email/brevo-stats', async (req, res) => {
+  try {
+    const days = req.query.days ? Number(req.query.days) : 1;
+    const stats = await fetchBrevoAggregatedStats({ days });
+    res.json(stats);
+  } catch (err) {
+    console.error(
+      'Error fetching Brevo stats:',
+      err.response?.data || err.message
+    );
+    res.status(500).json({ error: 'Failed to fetch Brevo stats' });
+  }
+});
+
+
 /* -------------------------------------------------------------------------- */
 /*                                 5. ADMIN API                               */
 /* -------------------------------------------------------------------------- */
@@ -579,26 +645,190 @@ app.get('/api/admin/users', async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*                6. PLACEHOLDERS FOR INSIGHTS API (SAFE STUBS)               */
+/*                            6. INSIGHTS / PERSONAS                          */
 /* -------------------------------------------------------------------------- */
 
+// GET /api/insights/:persona?icpId=123
 app.get('/api/insights/:persona', async (req, res) => {
-  res.json([]);
+  try {
+    const persona = decodeURIComponent(req.params.persona);
+    const icpId = Number(req.query.icpId);
+
+    if (!icpId || !persona) {
+      return res
+        .status(400)
+        .json({ error: 'icpId and persona are required' });
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        id,
+        icp_id AS "icpId",
+        industry,
+        persona,
+        title,
+        description,
+        relevance_score AS "relevance",
+        type,
+        is_custom AS "isCustom",
+        status
+      FROM persona_insights
+      WHERE icp_id = $1 AND persona = $2
+      ORDER BY relevance_score DESC, id ASC
+      `,
+      [icpId, persona]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching insights:', err);
+    res.status(500).json({ error: 'Failed to fetch insights' });
+  }
 });
 
+// PUT /api/insights/bulk-status   { updates: [{id, status}, ...] }
 app.put('/api/insights/bulk-status', async (req, res) => {
-  res.json({ success: true });
+  try {
+    const { updates } = req.body || {};
+    if (!Array.isArray(updates) || !updates.length) {
+      return res.status(400).json({ error: 'updates array is required' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const u of updates) {
+        if (!u.id || !u.status) continue;
+        await client.query(
+          'UPDATE persona_insights SET status = $1 WHERE id = $2',
+          [u.status, u.id]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error updating insight statuses:', err);
+    res.status(500).json({ error: 'Failed to update insights' });
+  }
 });
 
+// POST /api/insights/custom
 app.post('/api/insights/custom', async (req, res) => {
-  res.status(201).json({
-    id: Date.now(),
-    ...req.body,
-  });
+  try {
+    const {
+      icpId,
+      industry,
+      persona,
+      title,
+      description,
+      type,
+    } = req.body || {};
+
+    if (!icpId || !persona || !title || !description || !type) {
+      return res.status(400).json({
+        error: 'icpId, persona, title, description, and type are required',
+      });
+    }
+
+    const { rows } = await pool.query(
+      `
+      INSERT INTO persona_insights
+        (icp_id, industry, persona, title, description, relevance_score, type, is_custom, status)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, TRUE, 'unassigned')
+      RETURNING
+        id,
+        icp_id AS "icpId",
+        industry,
+        persona,
+        title,
+        description,
+        relevance_score AS "relevance",
+        type,
+        is_custom AS "isCustom",
+        status
+      `,
+      [
+        Number(icpId),
+        industry || 'General',
+        persona,
+        title,
+        description,
+        10, // default relevance for custom items
+        type,
+      ]
+    );
+
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error creating custom insight:', err);
+    res.status(500).json({ error: 'Failed to create custom insight' });
+  }
 });
 
+// DELETE /api/insights/:id
 app.delete('/api/insights/:id', async (req, res) => {
-  res.status(204).send();
+  try {
+    const id = Number(req.params.id);
+    if (!id) {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+
+    await pool.query('DELETE FROM persona_insights WHERE id = $1', [id]);
+    res.status(204).send();
+  } catch (err) {
+    console.error('Error deleting insight:', err);
+    res.status(500).json({ error: 'Failed to delete insight' });
+  }
+});
+
+// Personas helpers (used by PersonaMapping for extra personas)
+app.get('/api/personas', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT DISTINCT persona FROM persona_insights ORDER BY persona'
+    );
+    const names = rows.map((r) => r.persona).filter(Boolean);
+    res.json(names);
+  } catch (err) {
+    console.error('Error fetching personas:', err);
+    res.status(500).json({ error: 'Failed to fetch personas' });
+  }
+});
+
+app.post('/api/personas', async (req, res) => {
+  try {
+    const { name } = req.body || {};
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    // No dedicated persona table for now; just acknowledge.
+    res.status(201).json({ name: name.trim() });
+  } catch (err) {
+    console.error('Error creating persona:', err);
+    res.status(500).json({ error: 'Failed to create persona' });
+  }
+});
+
+app.delete('/api/personas/:name', async (req, res) => {
+  try {
+    const name = decodeURIComponent(req.params.name);
+    await pool.query('DELETE FROM persona_insights WHERE persona = $1', [
+      name,
+    ]);
+    res.status(204).send();
+  } catch (err) {
+    console.error('Error deleting persona:', err);
+    res.status(500).json({ error: 'Failed to delete persona' });
+  }
 });
 
 /* -------------------------------------------------------------------------- */
